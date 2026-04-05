@@ -150,15 +150,13 @@ Render
 
 ---
 
-### Link da aplicação
+### API em produção
 
-*A adicionar após deploy*
-
----
+https://api-desafio-backend-nno5.onrender.com
 
 ### Link da API
 
-*A adicionar após deploy*
+https://api-desafio-backend-nno5.onrender.com/docs
 
 ---
 
