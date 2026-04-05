@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
-from pydantic import BaseModel, EmailStr
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
+from pydantic import BaseModel, EmailStr, field_validator
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Boolean, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 DATABASE_URL = "sqlite:///./database.db"
@@ -11,7 +11,6 @@ engine = create_engine(
 )
 
 SessionLocal = sessionmaker(bind=engine)
-
 Base = declarative_base()
 
 app = FastAPI()
@@ -26,6 +25,17 @@ def get_db():
         db.close()
 
 
+# FUNÇÃO AUXILIAR PARA PADRONIZAR ERROS
+def erro(status_code: int, mensagem: str):
+    raise HTTPException(
+        status_code=status_code,
+        detail={
+            "error": mensagem,
+            "statusCode": status_code
+        }
+    )
+
+
 # MODELS DO BANCO
 
 class Aluno(Base):
@@ -34,6 +44,7 @@ class Aluno(Base):
     id = Column(Integer, primary_key=True, index=True)
     nome = Column(String, nullable=False)
     email = Column(String, nullable=False, unique=True)
+    ativo = Column(Boolean, default=True)  # soft delete
 
 
 class Curso(Base):
@@ -41,6 +52,7 @@ class Curso(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     titulo = Column(String, nullable=False)
+    ativo = Column(Boolean, default=True)  # soft delete
 
 
 class Matricula(Base):
@@ -58,9 +70,25 @@ class AlunoCreate(BaseModel):
     nome: str
     email: EmailStr
 
+    @field_validator("email")
+    def normalizar_email(cls, v):
+        return v.lower()
+
+    @field_validator("nome")
+    def validar_nome(cls, v):
+        if not v.strip():
+            raise ValueError("Nome não pode ser vazio")
+        return v.strip()
+
 
 class CursoCreate(BaseModel):
     titulo: str
+
+    @field_validator("titulo")
+    def validar_titulo(cls, v):
+        if not v.strip():
+            raise ValueError("Título não pode ser vazio")
+        return v.strip()
 
 
 class MatriculaCreate(BaseModel):
@@ -72,14 +100,30 @@ class MatriculaCreate(BaseModel):
 Base.metadata.create_all(bind=engine)
 
 
+# =========================
 # ROTAS DE ALUNOS
+# =========================
 
 @app.post("/alunos")
 def criar_aluno(aluno: AlunoCreate, db: Session = Depends(get_db)):
-    existente = db.query(Aluno).filter(Aluno.email == aluno.email).first()
+    existente = db.query(Aluno).filter(
+        Aluno.email == aluno.email
+    ).first()
 
     if existente:
-        raise HTTPException(status_code=400, detail="Email já cadastrado")
+        if existente.ativo:
+            erro(400, "Email já cadastrado")
+        else:
+            existente.nome = aluno.nome
+            existente.ativo = True
+            db.commit()
+            db.refresh(existente)
+
+            return {
+                "id": existente.id,
+                "nome": existente.nome,
+                "email": existente.email
+            }
 
     novo = Aluno(
         nome=aluno.nome,
@@ -98,8 +142,14 @@ def criar_aluno(aluno: AlunoCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/alunos")
-def listar_alunos(db: Session = Depends(get_db)):
-    alunos = db.query(Aluno).all()
+def listar_alunos(
+    skip: int = 0,
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    alunos = db.query(Aluno).filter(
+        Aluno.ativo == True
+    ).order_by(Aluno.nome).offset(skip).limit(limit).all()
 
     return [
         {
@@ -113,10 +163,13 @@ def listar_alunos(db: Session = Depends(get_db)):
 
 @app.get("/alunos/{id}")
 def buscar_aluno(id: int, db: Session = Depends(get_db)):
-    aluno = db.query(Aluno).filter(Aluno.id == id).first()
+    aluno = db.query(Aluno).filter(
+        Aluno.id == id,
+        Aluno.ativo == True
+    ).first()
 
     if not aluno:
-        raise HTTPException(status_code=404, detail="Aluno não encontrado")
+        erro(404, "Aluno não encontrado")
 
     return {
         "id": aluno.id,
@@ -127,10 +180,13 @@ def buscar_aluno(id: int, db: Session = Depends(get_db)):
 
 @app.put("/alunos/{id}")
 def atualizar_aluno(id: int, aluno: AlunoCreate, db: Session = Depends(get_db)):
-    aluno_db = db.query(Aluno).filter(Aluno.id == id).first()
+    aluno_db = db.query(Aluno).filter(
+        Aluno.id == id,
+        Aluno.ativo == True
+    ).first()
 
     if not aluno_db:
-        raise HTTPException(status_code=404, detail="Aluno não encontrado")
+        erro(404, "Aluno não encontrado")
 
     email_existente = db.query(Aluno).filter(
         Aluno.email == aluno.email,
@@ -138,12 +194,13 @@ def atualizar_aluno(id: int, aluno: AlunoCreate, db: Session = Depends(get_db)):
     ).first()
 
     if email_existente:
-        raise HTTPException(status_code=400, detail="Email já cadastrado")
+        erro(400, "Email já cadastrado")
 
     aluno_db.nome = aluno.nome
     aluno_db.email = aluno.email
 
     db.commit()
+    db.refresh(aluno_db)
 
     return {
         "id": aluno_db.id,
@@ -154,22 +211,47 @@ def atualizar_aluno(id: int, aluno: AlunoCreate, db: Session = Depends(get_db)):
 
 @app.delete("/alunos/{id}")
 def deletar_aluno(id: int, db: Session = Depends(get_db)):
-    aluno = db.query(Aluno).filter(Aluno.id == id).first()
+    aluno = db.query(Aluno).filter(
+        Aluno.id == id,
+        Aluno.ativo == True
+    ).first()
 
     if not aluno:
-        raise HTTPException(status_code=404, detail="Aluno não encontrado")
+        erro(404, "Aluno não encontrado")
 
-    db.delete(aluno)
+    aluno.ativo = False
     db.commit()
 
-    return {"mensagem": "Aluno deletado com sucesso"}
+    return {"mensagem": "Aluno desativado com sucesso"}
 
 
+# =========================
 # ROTAS DE CURSOS
+# =========================
 
 @app.post("/cursos")
 def criar_curso(curso: CursoCreate, db: Session = Depends(get_db)):
-    novo = Curso(titulo=curso.titulo)
+    titulo_normalizado = curso.titulo.strip().lower()
+
+    existente = db.query(Curso).filter(
+        func.lower(Curso.titulo) == titulo_normalizado
+    ).first()
+
+    if existente:
+        if existente.ativo:
+            erro(400, "Curso já cadastrado")
+        else:
+            existente.ativo = True
+            existente.titulo = curso.titulo.strip()
+            db.commit()
+            db.refresh(existente)
+
+            return {
+                "id": existente.id,
+                "titulo": existente.titulo
+            }
+
+    novo = Curso(titulo=curso.titulo.strip())
 
     db.add(novo)
     db.commit()
@@ -182,8 +264,14 @@ def criar_curso(curso: CursoCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/cursos")
-def listar_cursos(db: Session = Depends(get_db)):
-    cursos = db.query(Curso).all()
+def listar_cursos(
+    skip: int = 0,
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    cursos = db.query(Curso).filter(
+        Curso.ativo == True
+    ).order_by(Curso.titulo).offset(skip).limit(limit).all()
 
     return [
         {
@@ -196,10 +284,13 @@ def listar_cursos(db: Session = Depends(get_db)):
 
 @app.get("/cursos/{id}")
 def buscar_curso(id: int, db: Session = Depends(get_db)):
-    curso = db.query(Curso).filter(Curso.id == id).first()
+    curso = db.query(Curso).filter(
+        Curso.id == id,
+        Curso.ativo == True
+    ).first()
 
     if not curso:
-        raise HTTPException(status_code=404, detail="Curso não encontrado")
+        erro(404, "Curso não encontrado")
 
     return {
         "id": curso.id,
@@ -207,17 +298,43 @@ def buscar_curso(id: int, db: Session = Depends(get_db)):
     }
 
 
+@app.delete("/cursos/{id}")
+def deletar_curso(id: int, db: Session = Depends(get_db)):
+    curso = db.query(Curso).filter(
+        Curso.id == id,
+        Curso.ativo == True
+    ).first()
+
+    if not curso:
+        erro(404, "Curso não encontrado")
+
+    curso.ativo = False
+    db.commit()
+
+    return {"mensagem": "Curso desativado com sucesso"}
+
+
+# =========================
 # ROTAS DE MATRÍCULAS
+# =========================
 
 @app.post("/matriculas")
 def criar_matricula(dados: MatriculaCreate, db: Session = Depends(get_db)):
-    aluno = db.query(Aluno).filter(Aluno.id == dados.aluno_id).first()
-    if not aluno:
-        raise HTTPException(status_code=404, detail="Aluno não encontrado")
+    aluno = db.query(Aluno).filter(
+        Aluno.id == dados.aluno_id,
+        Aluno.ativo == True
+    ).first()
 
-    curso = db.query(Curso).filter(Curso.id == dados.curso_id).first()
+    if not aluno:
+        erro(404, "Aluno não encontrado")
+
+    curso = db.query(Curso).filter(
+        Curso.id == dados.curso_id,
+        Curso.ativo == True
+    ).first()
+
     if not curso:
-        raise HTTPException(status_code=404, detail="Curso não encontrado")
+        erro(404, "Curso não encontrado")
 
     matricula_existente = db.query(Matricula).filter(
         Matricula.aluno_id == dados.aluno_id,
@@ -225,7 +342,7 @@ def criar_matricula(dados: MatriculaCreate, db: Session = Depends(get_db)):
     ).first()
 
     if matricula_existente:
-        raise HTTPException(status_code=400, detail="Aluno já matriculado neste curso")
+        erro(400, "Aluno já matriculado neste curso")
 
     total_ativas = db.query(Matricula).filter(
         Matricula.aluno_id == dados.aluno_id,
@@ -233,7 +350,7 @@ def criar_matricula(dados: MatriculaCreate, db: Session = Depends(get_db)):
     ).count()
 
     if total_ativas >= 5:
-        raise HTTPException(status_code=400, detail="Aluno já possui 5 matrículas ativas")
+        erro(400, "Aluno já possui 5 matrículas ativas")
 
     nova = Matricula(
         aluno_id=dados.aluno_id,
@@ -254,8 +371,12 @@ def criar_matricula(dados: MatriculaCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/matriculas")
-def listar_matriculas(db: Session = Depends(get_db)):
-    matriculas = db.query(Matricula).all()
+def listar_matriculas(
+    skip: int = 0,
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    matriculas = db.query(Matricula).order_by(Matricula.id).offset(skip).limit(limit).all()
 
     return [
         {
@@ -273,10 +394,11 @@ def cancelar_matricula(id: int, db: Session = Depends(get_db)):
     matricula = db.query(Matricula).filter(Matricula.id == id).first()
 
     if not matricula:
-        raise HTTPException(status_code=404, detail="Matrícula não encontrada")
+        erro(404, "Matrícula não encontrada")
 
     matricula.status = "cancelada"
     db.commit()
+    db.refresh(matricula)
 
     return {
         "id": matricula.id,
@@ -291,10 +413,11 @@ def concluir_matricula(id: int, db: Session = Depends(get_db)):
     matricula = db.query(Matricula).filter(Matricula.id == id).first()
 
     if not matricula:
-        raise HTTPException(status_code=404, detail="Matrícula não encontrada")
+        erro(404, "Matrícula não encontrada")
 
     matricula.status = "concluida"
     db.commit()
+    db.refresh(matricula)
 
     return {
         "id": matricula.id,
@@ -305,12 +428,23 @@ def concluir_matricula(id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/alunos/{id}/cursos")
-def listar_cursos_do_aluno(id: int, db: Session = Depends(get_db)):
-    aluno = db.query(Aluno).filter(Aluno.id == id).first()
-    if not aluno:
-        raise HTTPException(status_code=404, detail="Aluno não encontrado")
+def listar_cursos_do_aluno(
+    id: int,
+    skip: int = 0,
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    aluno = db.query(Aluno).filter(
+        Aluno.id == id,
+        Aluno.ativo == True
+    ).first()
 
-    matriculas = db.query(Matricula).filter(Matricula.aluno_id == id).all()
+    if not aluno:
+        erro(404, "Aluno não encontrado")
+
+    matriculas = db.query(Matricula).filter(
+        Matricula.aluno_id == id
+    ).order_by(Matricula.id).offset(skip).limit(limit).all()
 
     return [
         {
@@ -323,12 +457,23 @@ def listar_cursos_do_aluno(id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/cursos/{id}/alunos")
-def listar_alunos_do_curso(id: int, db: Session = Depends(get_db)):
-    curso = db.query(Curso).filter(Curso.id == id).first()
-    if not curso:
-        raise HTTPException(status_code=404, detail="Curso não encontrado")
+def listar_alunos_do_curso(
+    id: int,
+    skip: int = 0,
+    limit: int = 10,
+    db: Session = Depends(get_db)
+):
+    curso = db.query(Curso).filter(
+        Curso.id == id,
+        Curso.ativo == True
+    ).first()
 
-    matriculas = db.query(Matricula).filter(Matricula.curso_id == id).all()
+    if not curso:
+        erro(404, "Curso não encontrado")
+
+    matriculas = db.query(Matricula).filter(
+        Matricula.curso_id == id
+    ).order_by(Matricula.id).offset(skip).limit(limit).all()
 
     return [
         {
